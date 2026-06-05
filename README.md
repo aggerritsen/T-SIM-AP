@@ -1,2 +1,100 @@
 # T-SIM-AP
-Wifi Access Point on SIM
+
+ESP-IDF firmware for a LilyGO T-SIM7080G-S3 style board that exposes a WiFi access point and routes clients over the SIM7080 cellular modem using PPP, IPv4 forwarding, NAPT, and a small DNS proxy.
+
+## Current Behavior
+
+- WiFi AP SSID: `AP-<last 3 bytes of AP MAC>`, for example `AP-A5BE6D`
+- WiFi password: `tsim7080`
+- AP address: `192.168.4.1`
+- DHCP client range: ESP-IDF default SoftAP DHCP range
+- DNS for clients: `192.168.4.1`, proxied to upstream DNS over PPP
+- Cellular path: SIM7080 PPP dial using `ATD*99***1#`
+- NAT: enabled on the AP interface after PPP receives an IP
+- Current modem data baud: `576000`
+
+This is intended for low-bandwidth IoT clients such as a WiFi thermostat. Heavy browser pages and speedtest sites may be very slow on CAT-M1.
+
+## Requirements
+
+- ESP-IDF 5.5.1 installed under `C:\Espressif\frameworks\esp-idf-v5.5.1`
+- ESP-IDF tools under the normal user tools path, for example `C:\Users\<user>\.espressif`
+- ESP32-S3 target
+- Board connected on a serial port, currently tested on `COM9`
+
+## Build And Flash
+
+Open PowerShell in this repo:
+
+```powershell
+. .\idf-env.ps1
+idf.py set-target esp32s3
+idf.py build
+idf.py -p COM9 flash monitor
+```
+
+Quit the monitor with `Ctrl+]`.
+
+## Configuration
+
+Main firmware variables live in [src/config.h](src/config.h).
+
+AP settings:
+
+```cpp
+static constexpr ApConfig AP_CONFIG = {
+    "AP",
+    "tsim7080",
+    6,
+    4,
+};
+```
+
+SIM/APN profiles currently include:
+
+- Onomondo: `onomondo`
+- KPNThings: `internet.m2m`
+- ThingsData/Tele2 2G-4G: `m2m.tele2.com`
+- ThingsData/Tele2 5G: `iot.tele2.com`
+
+The modem config currently uses:
+
+```cpp
+data_baud = 576000
+fallback_apn = "internet.m2m"
+```
+
+If modem communication becomes unreliable after baud experiments, set `data_baud` back to `460800` or `115200`, rebuild, and flash. The firmware also probes common baud rates during boot to recover a modem left at a previous test speed.
+
+## Expected Serial Milestones
+
+A healthy boot should show lines like:
+
+```text
+AP: ssid=AP-A5BE6D password=tsim7080 ip=192.168.4.1 dns=192.168.4.1
+DNS: proxy listening on 192.168.4.1:53
+MODEM: UART baud switched to 576000
+MODEM: IMSI=... supplier=KPNThings apn=internet.m2m
+MODEM: CEREG raw ... +CEREG: 2,1,...
+PPP: modem CONNECT, starting netif
+PPP: got IP ...
+ROUTER: NAT enabled on AP 192.168.4.1
+ROUTER: AP=... PPP=... NAT=on
+```
+
+Client connection:
+
+```text
+DHCP server assigned IP to a client, IP is: 192.168.4.2
+```
+
+## Troubleshooting
+
+- `MODEM: AT timeout` repeatedly: the modem may be on another baud. Recovery probes `115200`, configured baud, `460800`, and `921600`.
+- `+CME ERROR` after `AT+CNACT=0,0`: acceptable when no old data context is active.
+- `DNS: upstream timeout errno=11`: a DNS query timed out. Heavy web pages can cause many of these. IoT clients usually make far fewer queries.
+- Phone says connected but no internet: wait until serial shows `PPP connected` and `NAT enabled`, then reconnect the phone to refresh DHCP/DNS.
+
+## Repo Notes
+
+This is a native ESP-IDF project. PlatformIO files and generated build output are intentionally not tracked.
