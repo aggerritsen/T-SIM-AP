@@ -48,6 +48,8 @@ constexpr int MODEM_BAUD = 115200;
 constexpr int PPP_CONNECTED_BIT = BIT0;
 constexpr int PPP_FAILED_BIT = BIT1;
 constexpr int DNS_PROXY_PORT = 53;
+constexpr int DNS_UPSTREAM_TIMEOUT_MS = 2000;
+constexpr int DNS_TIMEOUT_LOG_INTERVAL_MS = 30000;
 
 constexpr uint8_t AXP2101_DC_ONOFF_DVM_CTRL = 0x80;
 constexpr uint8_t AXP2101_DC_VOL2_CTRL = 0x84;
@@ -533,6 +535,8 @@ void dns_proxy_task(void *)
     ESP_LOGI(TAG, "DNS: proxy listening on 192.168.4.1:%d", DNS_PROXY_PORT);
     uint8_t query[512] = {};
     uint8_t response[512] = {};
+    unsigned long dns_timeout_count = 0;
+    int64_t last_dns_timeout_log_ms = 0;
 
     while (true) {
         sockaddr_in client_addr = {};
@@ -554,11 +558,13 @@ void dns_proxy_task(void *)
         }
 
         timeval timeout = {};
-        timeout.tv_sec = 1;
+        timeout.tv_sec = DNS_UPSTREAM_TIMEOUT_MS / 1000;
+        timeout.tv_usec = (DNS_UPSTREAM_TIMEOUT_MS % 1000) * 1000;
         setsockopt(upstream_sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 
         const char *upstreams[] = {ppp_dns, "8.8.8.8"};
         bool answered = false;
+        int last_errno = 0;
         for (const char *server : upstreams) {
             if (!server || !server[0] || strcmp(server, "-") == 0 || strcmp(server, "0.0.0.0") == 0)
                 continue;
@@ -577,6 +583,7 @@ void dns_proxy_task(void *)
 
             sockaddr_in upstream_from = {};
             socklen_t upstream_len = sizeof(upstream_from);
+            errno = 0;
             int response_len = recvfrom(upstream_sock, response, sizeof(response), 0,
                                         reinterpret_cast<sockaddr *>(&upstream_from), &upstream_len);
             if (response_len > 0) {
@@ -585,9 +592,20 @@ void dns_proxy_task(void *)
                 answered = true;
                 break;
             }
+            last_errno = errno;
         }
         if (!answered) {
-            ESP_LOGW(TAG, "DNS: upstream timeout errno=%d", errno);
+            if (last_errno == EAGAIN || last_errno == EWOULDBLOCK) {
+                dns_timeout_count++;
+                int64_t now_ms = esp_timer_get_time() / 1000;
+                if (now_ms - last_dns_timeout_log_ms >= DNS_TIMEOUT_LOG_INTERVAL_MS) {
+                    ESP_LOGI(TAG, "DNS: upstream timeout count=%lu errno=%d", dns_timeout_count, last_errno);
+                    dns_timeout_count = 0;
+                    last_dns_timeout_log_ms = now_ms;
+                }
+            } else {
+                ESP_LOGW(TAG, "DNS: upstream receive failed errno=%d", last_errno);
+            }
         }
 
         close(upstream_sock);

@@ -58,7 +58,7 @@ static constexpr SimProfile SIM_PROFILES[] = {
 static constexpr ModemConfig MODEM_CONFIG = {
     true,
     true,
-    576000,
+    115200,
     60000,
     "CAT-M",
     "internet.m2m",
