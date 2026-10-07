@@ -50,6 +50,11 @@ constexpr int PPP_FAILED_BIT = BIT1;
 constexpr int DNS_PROXY_PORT = 53;
 constexpr int DNS_UPSTREAM_TIMEOUT_MS = 2000;
 constexpr int DNS_TIMEOUT_LOG_INTERVAL_MS = 30000;
+constexpr size_t WIFI_SSID_MAX_LEN = 32;
+constexpr size_t WIFI_PASSWORD_MAX_LEN = 63;
+constexpr uint8_t WIFI_CHANNEL_MIN = 1;
+constexpr uint8_t WIFI_CHANNEL_MAX = 13;
+constexpr uint8_t WIFI_SOFTAP_MAX_CLIENTS = 10;
 
 constexpr uint8_t AXP2101_DC_ONOFF_DVM_CTRL = 0x80;
 constexpr uint8_t AXP2101_DC_VOL2_CTRL = 0x84;
@@ -339,6 +344,7 @@ std::string read_identity(const char *cmd, const char *prefix)
     if (!at_collect(cmd, response, sizeof(response), 3000))
         return {};
 
+    ESP_LOGI(TAG, "MODEM: AT%s raw %s", cmd, response);
     std::string value = extract_line_value(response, prefix);
     if (value.empty()) {
         std::string text(response);
@@ -357,6 +363,20 @@ std::string read_identity(const char *cmd, const char *prefix)
     return value;
 }
 
+bool equals_ignore_case(const char *left, const char *right)
+{
+    if (!left || !right)
+        return false;
+
+    while (*left && *right) {
+        if (std::toupper((unsigned char)*left) != std::toupper((unsigned char)*right))
+            return false;
+        left++;
+        right++;
+    }
+    return *left == *right;
+}
+
 bool starts_with_any(const char *value, const char *const prefixes[4])
 {
     if (!value || !value[0])
@@ -366,6 +386,59 @@ bool starts_with_any(const char *value, const char *const prefixes[4])
             return true;
     }
     return false;
+}
+
+void log_modem_diagnostics(const char *reason)
+{
+    char response[512] = {};
+    ESP_LOGI(TAG, "MODEM: diagnostics begin: %s", reason ? reason : "-");
+    at_collect("+CPIN?", response, sizeof(response), 3000);
+    ESP_LOGI(TAG, "MODEM: CPIN raw %s", response);
+    at_collect("+CSQ", response, sizeof(response), 2000);
+    ESP_LOGI(TAG, "MODEM: CSQ raw %s", response);
+    at_collect("+COPS?", response, sizeof(response), 3000);
+    ESP_LOGI(TAG, "MODEM: COPS raw %s", response);
+    at_collect("+CPSI?", response, sizeof(response), 3000);
+    ESP_LOGI(TAG, "MODEM: CPSI raw %s", response);
+    at_collect("+CEREG?", response, sizeof(response), 2500);
+    ESP_LOGI(TAG, "MODEM: CEREG raw %s", response);
+    at_collect("+CGREG?", response, sizeof(response), 2500);
+    ESP_LOGI(TAG, "MODEM: CGREG raw %s", response);
+    at_collect("+CREG?", response, sizeof(response), 2500);
+    ESP_LOGI(TAG, "MODEM: CREG raw %s", response);
+    at_collect("+CGDCONT?", response, sizeof(response), 3000);
+    ESP_LOGI(TAG, "MODEM: CGDCONT raw %s", response);
+    ESP_LOGI(TAG, "MODEM: diagnostics end");
+}
+
+void apply_preferred_radio_mode()
+{
+    const char *mode = MODEM_CONFIG.preferred_radio_mode;
+    if (!mode || !mode[0])
+        return;
+
+    int cmnb = 0;
+    if (equals_ignore_case(mode, "CAT-M") ||
+        equals_ignore_case(mode, "CATM") ||
+        equals_ignore_case(mode, "LTE-M")) {
+        cmnb = 1;
+    } else if (equals_ignore_case(mode, "NB-IOT") ||
+               equals_ignore_case(mode, "NBIOT") ||
+               equals_ignore_case(mode, "NB")) {
+        cmnb = 2;
+    } else if (equals_ignore_case(mode, "AUTO") ||
+               equals_ignore_case(mode, "BOTH")) {
+        cmnb = 3;
+    } else {
+        ESP_LOGW(TAG, "MODEM: unknown preferred radio mode '%s'", mode);
+        return;
+    }
+
+    ESP_LOGI(TAG, "MODEM: preferred radio mode %s (CMNB=%d)", mode, cmnb);
+    at_ok("+CNMP=38", 3000);
+    char cmd[24] = {};
+    snprintf(cmd, sizeof(cmd), "+CMNB=%d", cmnb);
+    at_ok(cmd, 3000);
 }
 
 const SimProfile *find_sim_profile()
@@ -408,6 +481,7 @@ bool wait_for_registration(uint32_t timeout_ms)
         }
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
+    log_modem_diagnostics("registration timeout");
     return false;
 }
 
@@ -441,11 +515,15 @@ bool init_modem_at(const char **apn_out)
     at_ok("+CEREG=2", 2000);
     at_ok("+CREG=2", 2000);
     at_ok("+CGREG=2", 2000);
+    log_modem_diagnostics("before operator select");
+    apply_preferred_radio_mode();
     at_ok("+COPS=0", 15000);
     set_modem_data_baud();
 
     std::string imsi = read_identity("+CIMI", "");
-    std::string iccid = read_identity("+CCID", "+CCID");
+    std::string iccid = read_identity("+CCID", "");
+    if (iccid.empty())
+        iccid = read_identity("+CICCID", "+ICCID");
     if (!imsi.empty())
         snprintf(sim_imsi, sizeof(sim_imsi), "%s", imsi.c_str());
     if (!iccid.empty())
@@ -692,6 +770,31 @@ esp_err_t start_ppp(const char *apn)
     return ESP_OK;
 }
 
+esp_err_t validate_ap_config()
+{
+    ESP_RETURN_ON_FALSE(AP_CONFIG.ssid_prefix && AP_CONFIG.ssid_prefix[0],
+                        ESP_ERR_INVALID_ARG, TAG, "AP SSID prefix is empty");
+    ESP_RETURN_ON_FALSE(AP_CONFIG.password,
+                        ESP_ERR_INVALID_ARG, TAG, "AP password is null");
+
+    const size_t prefix_len = strlen(AP_CONFIG.ssid_prefix);
+    const size_t generated_suffix_len = 1 + 6; // "-" plus 3 MAC bytes in hex.
+    ESP_RETURN_ON_FALSE(prefix_len + generated_suffix_len <= WIFI_SSID_MAX_LEN,
+                        ESP_ERR_INVALID_ARG, TAG, "AP SSID prefix too long");
+
+    const size_t password_len = strlen(AP_CONFIG.password);
+    ESP_RETURN_ON_FALSE(password_len == 0 || password_len >= 8,
+                        ESP_ERR_INVALID_ARG, TAG, "AP password must be empty or at least 8 characters");
+    ESP_RETURN_ON_FALSE(password_len <= WIFI_PASSWORD_MAX_LEN,
+                        ESP_ERR_INVALID_ARG, TAG, "AP password too long");
+
+    ESP_RETURN_ON_FALSE(AP_CONFIG.channel >= WIFI_CHANNEL_MIN && AP_CONFIG.channel <= WIFI_CHANNEL_MAX,
+                        ESP_ERR_INVALID_ARG, TAG, "AP channel must be 1-13");
+    ESP_RETURN_ON_FALSE(AP_CONFIG.max_clients > 0 && AP_CONFIG.max_clients <= WIFI_SOFTAP_MAX_CLIENTS,
+                        ESP_ERR_INVALID_ARG, TAG, "AP max clients must be 1-10");
+    return ESP_OK;
+}
+
 void build_ap_ssid()
 {
     uint8_t mac[6] = {};
@@ -702,6 +805,7 @@ void build_ap_ssid()
 
 esp_err_t start_wifi_ap()
 {
+    ESP_RETURN_ON_ERROR(validate_ap_config(), TAG, "AP config validation");
     build_ap_ssid();
 
     ap_netif = esp_netif_create_default_wifi_ap();
@@ -725,11 +829,12 @@ esp_err_t start_wifi_ap()
     wifi_config_t wifi_config = {};
     size_t ssid_len = strnlen(ap_ssid, sizeof(wifi_config.ap.ssid));
     memcpy(wifi_config.ap.ssid, ap_ssid, ssid_len);
+    size_t password_len = strlen(AP_CONFIG.password);
     strncpy(reinterpret_cast<char *>(wifi_config.ap.password), AP_CONFIG.password, sizeof(wifi_config.ap.password) - 1);
     wifi_config.ap.ssid_len = ssid_len;
     wifi_config.ap.channel = AP_CONFIG.channel;
     wifi_config.ap.max_connection = AP_CONFIG.max_clients;
-    wifi_config.ap.authmode = strlen(AP_CONFIG.password) >= 8 ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
+    wifi_config.ap.authmode = password_len >= 8 ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
     wifi_config.ap.pmf_cfg.required = false;
 
     ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_AP, &wifi_config), TAG, "wifi config");
